@@ -19,6 +19,21 @@ outputs — saving the full text to a cache file for later.
 Before every generation and before every compaction it **prunes** old tool output, and it injects a
 short context-discipline system prompt for the model.
 
+The plugin also tracks how much context it has used (an estimate based on message length) and prunes
+before each generate request against a **generation budget** (about 22K tokens) — keeping the recent
+conversation and dropping stale tool output as needed — and before each compaction request against a
+much tighter **compaction budget** (about 10K tokens) so the summary itself fits comfortably in a
+32K window. Tool schemas are stripped from the compaction input, and old reasoning fields are dropped.
+
+## How much context is left?
+
+`context-guard` keeps a running estimate (roughly characters ÷ 3.6, with ASCII bonus) of the current
+context — messages, system prompt, and tool schemas — and logs before/after token counts on prune and
+compaction events, so you can see the guard actually doing its job rather than trusting it blindly.
+
+The numbers above are starting points for a 32K local model; tweak the budgets in the plugin constants to
+match your model's window.
+
 ## Why "just raise the limit"?
 
 The guard deliberately does **not** touch `limit.context`, `limit.output`, or the model variant.
