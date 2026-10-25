@@ -15,6 +15,10 @@
 3. 增加 `file_outline` 工具，让模型先看结构再读内容；
 4. 在生成和 compaction 前清理旧的工具输出，并注入简短的上下文纪律提示词。
 
+每次生成前会按 **生成预算**（约 22K tokens）清理；compaction 前会压缩到更紧的 **压缩预算**（约 10K tokens），并从 compaction 输入中移除工具 schema、丢弃过期的 reasoning 字段。
+
+插件同时记录每次 prune / compaction 前的 token 估算，方便实时观察上下文消耗。两个插件均内置 token 用量估算（按字符 ÷ 3.6）。
+
 ### `ollama-discovery.ts`
 
 为通过网关（`/api/tags`）发现的所有 Ollama 模型统一设置 context/output 上限，而不是依赖各模型各自的默认值。

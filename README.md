@@ -20,6 +20,15 @@ It works in four steps:
 4. **Prune** old tool output before generation and before compaction, and inject a short
    context-discipline system prompt.
 
+Before every generate request it prunes against a **generation budget** (~22K tokens); before every
+compaction it shrinks the input to a tighter **compaction budget** (~10K tokens), strips tool schemas
+from the summary request, and drops stale reasoning fields.
+
+It also logs before/after token estimates on prune and compaction events so you can watch context usage
+in real time.
+
+Both plugins ship token-usage estimates (roughly characters ÷ 3.6) for monitoring context pressure.
+
 ### `ollama-discovery.ts`
 
 Applies uniform context/output limits to every Ollama model discovered via the gateway
