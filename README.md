@@ -2,6 +2,8 @@
 
 Small opencode plugins for working with **small local models** (e.g. Ollama with a 32K context window).
 
+> [中文版 README](README.zh-CN.md)
+
 ## Plugins
 
 ### `context-guard.ts`

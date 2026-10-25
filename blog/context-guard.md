@@ -33,3 +33,7 @@ The source is in [`BruceFooo/opencode-plugins`](https://github.com/BruceFooo/ope
 - [`ollama-discovery.ts`](https://github.com/BruceFooo/opencode-plugins/blob/main/ollama-discovery.ts) — uniform context/output limits for discovered Ollama models
 
 Copy the `.ts` files into your opencode plugin directory and restart opencode.
+
+---
+
+*中文版：[让 Ollama Agent 留在上下文窗口内](context-guard.zh-CN.md)*
