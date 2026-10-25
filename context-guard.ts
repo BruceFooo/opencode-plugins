@@ -1,0 +1,802 @@
+// opencode 2.x context guard for small local-model windows.
+//
+// The model is loaded by Ollama with a 32K context. A single whole-file read
+// can consume most of it, and a compaction request that carries the full
+// history plus a 16K output allowance overflows. This plugin:
+//   1. forces `read` into 300-line pages and repairs path -> filePath
+//   2. caps large tool outputs and saves the full text to a cache file
+//   3. adds file_outline so the model can inspect structure before reading
+//   4. prunes old tool output before generation and before compaction
+//   5. injects a short context-discipline system prompt for Ollama models
+//
+// It intentionally does NOT change limit.output, limit.context, or the model
+// variant. Compaction keeps its normal 16K output allowance; we only shrink
+// the prompt so prompt + output fits.
+
+import { promises as fs } from "node:fs"
+import os from "node:os"
+import path from "node:path"
+
+const CONTEXT_LIMIT = 32768
+const OUTPUT_LIMIT = 16184
+const MAX_READ_LINES = 300
+const MAX_TOOL_CHARS = 16000
+const GENERATE_BUDGET = 22000
+const COMPACTION_BUDGET = 10000
+const CACHE_DIR = path.join(os.homedir(), ".cache", "opencode", "context-guard")
+
+const BINARY_EXT =
+  /\.(png|jpe?g|gif|webp|bmp|ico|pdf|zip|gz|tgz|7z|rar|exe|dll|so|dylib|mp4|mp3|wav|webm|woff2?|ttf|otf|bin|dat)$/i
+
+const READ_DESCRIPTION = `Read one bounded page of a text file. Always pass filePath, offset (line number), and limit (lines).
+
+This deployment clamps limit to ${MAX_READ_LINES} lines. The result is JSON:
+{ type: "text-page", content, mime, offset, truncated, next?, hint? }
+
+If truncated is true, call read again with the same filePath, offset=next, limit=${MAX_READ_LINES}. Never request an entire large file in one call. For files over ${MAX_READ_LINES} lines, call file_outline first and read only the relevant ranges. For images/PDFs, offset and limit are ignored.`
+
+const DISCIPLINE = `<context-discipline>
+Context window is 32K tokens. Never read a whole large file in one call.
+1) Call file_outline first for any file you have not seen.
+2) Read at most ${MAX_READ_LINES} lines per read call; if the result says truncated, continue with offset=next.
+3) For files over ${MAX_READ_LINES} lines, multi-file analysis, or a 65KB+ page/schema, delegate to the \`reader\` subagent.
+4) If a tool output is truncated, use grep/sed on the saved path instead of re-running the same tool.
+5) Summarize findings in your own words before moving on; do not keep raw file contents in context.
+6) For multi-file or multi-step work, delegate independent parts to the \`reader\`/\`general\` subagents and keep only their summaries here.
+7) If you must read many chunks yourself, maintain a notes file under .opencode/notes/ (gitignored) and rely on the notes instead of remembering raw chunks.
+Prefer tool calls over prose; keep explanations short unless asked.
+</context-discipline>`
+
+const COMPACTION_NOTE = `<handoff-rules>
+Local model context is ${CONTEXT_LIMIT} tokens. This request must leave ${OUTPUT_LIMIT} tokens for the reply.
+Write a concise handoff summary. Hard budget: about 1200 words / 1500 tokens.
+Do not call tools. Do not restate raw file contents, tool outputs, or AGENTS.md conventions; cite path:line instead.
+Include: (1) the user's goal, (2) decisions and what was done, (3) files changed with paths,
+(4) exact next steps, (5) blockers/open questions.
+Use terse bullets and the required summary template. Output only the summary. Do not mention compaction.
+</handoff-rules>`
+
+type ToolEditor = {
+  get(name: string): any
+  update(name: string, fn: (tool: any) => void): void
+  add(tool: any): void
+}
+
+export default {
+  id: "context-guard",
+  setup: async (ctx: any) => {
+    let outlineRegistered = false
+    let toolRegistrationError: string | undefined
+
+    // 1) Rewrite the read tool description and add file_outline.
+    try {
+      if (ctx.tool?.transform) {
+        await ctx.tool.transform((editor: ToolEditor) => {
+          if (editor.get("read")) {
+            editor.update("read", (tool) => {
+              tool.description = READ_DESCRIPTION
+            })
+          }
+
+          editor.add({
+            name: "file_outline",
+            description:
+              "Return a bounded structural outline of a text file: headings, functions, classes, top-level JSON keys, and line numbers. Use this before reading a large file. Never returns the full file.",
+            input: {
+              type: "object",
+              additionalProperties: false,
+              required: ["filePath"],
+              properties: {
+                filePath: { type: "string", description: "Path to the file to outline" },
+                maxItems: {
+                  type: "integer",
+                  minimum: 10,
+                  maximum: 200,
+                  description: "Maximum number of structural hits to return (default 120)",
+                },
+              },
+            },
+            output: {
+              type: "object",
+              additionalProperties: false,
+              required: ["type", "content"],
+              properties: {
+                type: { const: "text" },
+                content: { type: "string" },
+              },
+            },
+            options: { codemode: false },
+            execute: async (args: any, toolCtx: any) => {
+              const text = await outlineFile(
+                String(args?.filePath ?? ""),
+                Math.min(200, Math.max(10, Number(args?.maxItems) || 120)),
+                toolCtx?.directory,
+              )
+              return {
+                output: { type: "text", content: text },
+                content: text,
+                metadata: { filePath: String(args?.filePath ?? "") },
+              }
+            },
+          })
+          outlineRegistered = Boolean(editor.get("file_outline"))
+        })
+      }
+    } catch (error) {
+      toolRegistrationError = error instanceof Error ? (error.stack ?? error.message) : String(error)
+      warn("failed to register file_outline / read description", error)
+    }
+
+    // 2) Tool argument and result hooks.
+    try {
+      if (ctx.tool?.hook) {
+        await ctx.tool.hook("execute.before", onExecuteBefore)
+        await ctx.tool.hook("execute.after", onExecuteAfter)
+      }
+    } catch (error) {
+      warn("failed to register tool hooks", error)
+    }
+
+    // 3) Session hooks for generation and compaction.
+    try {
+      if (ctx.session?.hook) {
+        // "context" is where the tool list and system prompt are assembled;
+        // "generate" is the final pre-call pass. Both need the same trimming.
+        await ctx.session.hook("context", async (draft: any) => onGenerate(ctx, draft))
+        await ctx.session.hook("generate", async (draft: any) => onGenerate(ctx, draft))
+        await ctx.session.hook("compaction", async (draft: any) => onCompaction(ctx, draft))
+      }
+    } catch (error) {
+      warn("failed to register session hooks", error)
+    }
+
+    let toolNames: string[] = []
+    try {
+      const tools = await ctx.tool?.list?.()
+      toolNames = (tools ?? []).map((tool: any) => String(tool?.name ?? tool?.id ?? ""))
+    } catch {}
+
+    try {
+      await fs.mkdir(CACHE_DIR, { recursive: true })
+      await fs.writeFile(
+        path.join(CACHE_DIR, "status.json"),
+        JSON.stringify(
+          {
+            at: new Date().toISOString(),
+            outlineRegistered,
+            toolRegistrationError,
+            hasToolTransform: Boolean(ctx.tool?.transform),
+            hasToolHook: Boolean(ctx.tool?.hook),
+            hasSessionHook: Boolean(ctx.session?.hook),
+            toolNames,
+          },
+          null,
+          2,
+        ),
+        "utf8",
+      )
+    } catch {}
+
+    log(ctx, "info", "context-guard ready", {
+      contextLimit: CONTEXT_LIMIT,
+      outputLimit: OUTPUT_LIMIT,
+      maxReadLines: MAX_READ_LINES,
+      generateBudget: GENERATE_BUDGET,
+      compactionBudget: COMPACTION_BUDGET,
+    })
+  },
+}
+
+// ---------------------------------------------------------------------------
+// Logging
+// ---------------------------------------------------------------------------
+
+function log(ctx: any, level: string, message: string, extra?: any) {
+  try {
+    const result = ctx?.rpc?.app?.log?.({
+      body: { service: "context-guard", level, message, extra },
+    })
+    if (result && typeof result.catch === "function") result.catch(() => {})
+  } catch {}
+}
+
+function warn(message: string, error?: unknown) {
+  console.error(`[context-guard] ${message}`, error instanceof Error ? error.message : (error ?? ""))
+}
+
+// ---------------------------------------------------------------------------
+// Tool hooks
+// ---------------------------------------------------------------------------
+
+async function onExecuteBefore(input: any) {
+  if (!input) return
+
+  // The custom outline tool uses filePath too; let local models that emit
+  // `path` pass validation by renaming before the schema check.
+  if (input.tool === "file_outline") {
+    const outlineArgs = input.input
+    if (outlineArgs && typeof outlineArgs === "object") {
+      if (!outlineArgs.filePath && typeof outlineArgs.path === "string") outlineArgs.filePath = outlineArgs.path
+      input.input = outlineArgs
+    }
+    return
+  }
+
+  if (input.tool !== "read") return
+  const args = input.input
+  if (!args || typeof args !== "object") return
+
+  // Some local models emit `path` instead of the required `filePath`.
+  if (!args.filePath && typeof args.path === "string") args.filePath = args.path
+  if (typeof args.filePath !== "string" || args.filePath.length === 0) return
+  if (BINARY_EXT.test(args.filePath)) return
+
+  // Do not invent an offset: the read tool's default is correct regardless of
+  // whether it is 0-based or 1-based. Only clamp an explicit offset and limit.
+  const offset = Number(args.offset)
+  if (Number.isFinite(offset) && offset >= 0) args.offset = Math.floor(offset)
+  else delete args.offset
+
+  const limit = Number(args.limit)
+  args.limit = Number.isFinite(limit) && limit > 0 ? Math.min(Math.floor(limit), MAX_READ_LINES) : MAX_READ_LINES
+
+  input.input = args
+}
+
+async function onExecuteAfter(result: any) {
+  try {
+    if (!result || result.status !== "completed") return
+    const tool = String(result.tool ?? "")
+
+    if (tool === "read") {
+      addReadPageHint(result)
+      return
+    }
+
+    if (!["webfetch", "grep", "glob", "list", "shell", "bash"].includes(tool)) return
+    await capToolOutput(result, tool)
+  } catch (error) {
+    warn("execute.after failed", error)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Read pagination hint
+// ---------------------------------------------------------------------------
+
+type PageLocation = {
+  page: any
+  write: (page: any) => void
+  contentHint: (hint: string) => void
+}
+
+function locatePage(result: any): PageLocation | undefined {
+  const res = result?.result
+  if (!res) return
+
+  const out = res.output
+  if (out && typeof out === "object" && out.type === "text-page") {
+    return {
+      page: out,
+      write: (page) => {
+        res.output = page
+      },
+      contentHint: (hint) => addHintToContent(res, hint),
+    }
+  }
+  if (typeof out === "string") {
+    const page = safeParse(out)
+    if (page?.type === "text-page") {
+      return {
+        page,
+        write: (p) => {
+          res.output = JSON.stringify(p)
+        },
+        contentHint: (hint) => addHintToContent(res, hint),
+      }
+    }
+  }
+
+  const content = res.content
+  if (typeof content === "string") {
+    const page = safeParse(content)
+    if (page?.type === "text-page") {
+      return {
+        page,
+        write: (p) => {
+          res.content = JSON.stringify(p)
+        },
+        contentHint: (hint) => {
+          try {
+            const parsed = JSON.parse(res.content)
+            parsed.hint = hint
+            res.content = JSON.stringify(parsed)
+          } catch {
+            res.content += `\n\n[${hint}]`
+          }
+        },
+      }
+    }
+  }
+  if (Array.isArray(content)) {
+    for (const part of content) {
+      if (part?.type !== "text" || typeof part.text !== "string") continue
+      const page = safeParse(part.text)
+      if (page?.type !== "text-page") continue
+      return {
+        page,
+        write: (p) => {
+          part.text = JSON.stringify(p)
+        },
+        contentHint: (hint) => {
+          try {
+            const parsed = JSON.parse(part.text)
+            parsed.hint = hint
+            part.text = JSON.stringify(parsed)
+          } catch {
+            part.text += `\n\n[${hint}]`
+          }
+        },
+      }
+    }
+  }
+  return
+}
+
+function addReadPageHint(result: any) {
+  const located = locatePage(result)
+  if (!located) return
+  const { page } = located
+  if (page?.truncated !== true) return
+
+  const filePath = String(result?.input?.filePath ?? "").replace(/\\/g, "\\\\").replace(/"/g, '\\"')
+  const content = typeof page.content === "string" ? page.content : ""
+  const lineCount = content ? content.split(/\r?\n/).length : MAX_READ_LINES
+  const base = Number.isFinite(Number(page.offset)) ? Number(page.offset) : 0
+  const next = Number.isFinite(Number(page.next)) ? Number(page.next) : base + lineCount
+  const suggestedLimit = Math.min(MAX_READ_LINES, Math.max(1, lineCount))
+  const hint = `Page truncated. Next page: call read with filePath="${filePath}" offset=${next} limit=${suggestedLimit}. Do not request the rest at once.`
+
+  page.hint = hint
+  located.write(page)
+  located.contentHint(hint)
+}
+
+function addHintToContent(res: any, hint: string) {
+  const content = res?.content
+  if (typeof content === "string") {
+    try {
+      const page = JSON.parse(content)
+      page.hint = hint
+      res.content = JSON.stringify(page)
+    } catch {
+      res.content = `${content}\n\n[${hint}]`
+    }
+    return
+  }
+  if (Array.isArray(content)) {
+    const part = content.find((p: any) => p?.type === "text" && typeof p.text === "string")
+    if (part) {
+      try {
+        const page = JSON.parse(part.text)
+        page.hint = hint
+        part.text = JSON.stringify(page)
+      } catch {
+        part.text += `\n\n[${hint}]`
+      }
+    } else {
+      content.push({ type: "text", text: `[${hint}]` })
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Generic tool output cap
+// ---------------------------------------------------------------------------
+
+async function capToolOutput(result: any, tool: string) {
+  const res = result?.result
+  if (!res) return
+  const id = String(result.id ?? result.callID ?? "unknown")
+  const targets: { holder: any; key: string; value: string }[] = []
+
+  if (typeof res.content === "string") {
+    targets.push({ holder: res, key: "content", value: res.content })
+  } else if (Array.isArray(res.content)) {
+    for (const part of res.content) {
+      if (part?.type === "text" && typeof part.text === "string") {
+        targets.push({ holder: part, key: "text", value: part.text })
+      }
+    }
+  }
+
+  for (const target of targets) {
+    if (target.value.length <= MAX_TOOL_CHARS) continue
+
+    const saved = await saveFullOutput(tool, id, target.value).catch(() => "<save failed>")
+    const head = target.value.slice(0, 8000)
+    const tail = target.value.slice(-4000)
+    const notice = `\n\n... [truncated ${target.value.length} chars; full output: ${saved}] ...\n\n`
+    const extra =
+      tool === "webfetch"
+        ? "\n[Use grep/sed on the saved file or fetch a more specific URL instead of re-fetching.]"
+        : ""
+    target.holder[target.key] = head + notice + tail + extra
+  }
+}
+
+async function saveFullOutput(tool: string, id: string, text: string): Promise<string> {
+  await fs.mkdir(CACHE_DIR, { recursive: true })
+  const safeTool = tool.replace(/[^A-Za-z0-9_-]/g, "_")
+  const safeId = id.replace(/[^A-Za-z0-9_-]/g, "_")
+  const file = path.join(CACHE_DIR, `${safeTool}-${safeId}.txt`)
+  await fs.writeFile(file, text, "utf8")
+  return file
+}
+
+// ---------------------------------------------------------------------------
+// Session hooks
+// ---------------------------------------------------------------------------
+
+async function onGenerate(ctx: any, draft: any) {
+  try {
+    if (draft?.model?.providerID !== "ollama") return
+    if (draft?.agent === "compaction" || draft?.agent === "title" || draft?.agent === "summary") return
+    if (!Array.isArray(draft?.messages)) return
+
+    // Drop tools the local model rarely uses. Keep the core coding toolset:
+    // read, file_outline, edit, write, glob, grep, shell, subagent, question,
+    // webfetch. Removing `execute` also removes the codemode tools namespace,
+    // which is a major source of confusion for a small model.
+    for (const name of ["batch", "websearch", "execute", "skill", "todo", "todoread", "todowrite"]) {
+      if (draft.tools && Object.prototype.hasOwnProperty.call(draft.tools, name)) delete draft.tools[name]
+    }
+
+    // Inject the context-discipline block once per request.
+    if (Array.isArray(draft.system)) {
+      const marker = "<context-discipline>"
+      const already = draft.system.some(
+        (message: any) => typeof message?.text === "string" && message.text.includes(marker),
+      )
+      if (!already) {
+        const first = draft.system[0]
+        if (first && typeof first.text === "string") first.text += `\n\n${DISCIPLINE}`
+        else draft.system.push({ type: "text", text: DISCIPLINE })
+      }
+    }
+
+    const used =
+      estimateTokens(draft.messages) + estimateTokens(draft.system) + estimateToolTokens(draft.tools)
+    if (used <= GENERATE_BUDGET) return
+
+    pruneMessages(draft.messages, {
+      keepRecent: 6,
+      maxToolChars: 800,
+      maxTextChars: 0,
+      dropReasoning: true,
+      placeholder: "[old tool output pruned to save context; re-run the tool if needed]",
+    })
+
+    log(ctx, "info", "pruned old tool output", {
+      sessionID: draft.sessionID,
+      agent: draft.agent,
+      beforeTokens: used,
+      afterTokens: estimateTokens(draft.messages) + estimateTokens(draft.system) + estimateToolTokens(draft.tools),
+    })
+  } catch (error) {
+    warn("generate hook failed", error)
+  }
+}
+
+async function onCompaction(ctx: any, draft: any) {
+  try {
+    if (draft?.model?.providerID !== "ollama") return
+
+    const before = estimateTokens(draft.messages) + estimateTokens(draft.system) + estimateToolTokens(draft.tools)
+
+    // The summary request must not carry tool schemas.
+    if (draft.tools && typeof draft.tools === "object") {
+      for (const name of Object.keys(draft.tools)) delete draft.tools[name]
+    }
+
+    if (Array.isArray(draft.messages)) {
+      const options = {
+        keepRecent: 2,
+        maxToolChars: 400,
+        maxTextChars: 1200,
+        dropReasoning: true,
+        placeholder: "[tool output omitted during compaction]",
+      }
+      pruneMessages(draft.messages, options)
+      shrinkToBudget(draft.messages, COMPACTION_BUDGET, options)
+    }
+
+    if (Array.isArray(draft.system)) {
+      const already = draft.system.some(
+        (message: any) => typeof message?.text === "string" && message.text.includes("<handoff-rules>"),
+      )
+      if (!already) draft.system.push({ type: "text", text: COMPACTION_NOTE })
+    }
+
+    const after = estimateTokens(draft.messages) + estimateTokens(draft.system)
+    try {
+      await fs.mkdir(CACHE_DIR, { recursive: true })
+      await fs.writeFile(
+        path.join(CACHE_DIR, "last-compaction.json"),
+        JSON.stringify(
+          {
+            at: new Date().toISOString(),
+            sessionID: draft.sessionID,
+            messages: Array.isArray(draft.messages) ? draft.messages.length : -1,
+            tools: Object.keys(draft.tools ?? {}).length,
+            before,
+            after,
+            roles: Array.isArray(draft.messages) ? draft.messages.map((m: any) => m?.role) : [],
+          },
+          null,
+          2,
+        ),
+        "utf8",
+      )
+    } catch {}
+
+    log(ctx, "info", "compaction input pruned", {
+      sessionID: draft.sessionID,
+      messages: draft.messages?.length,
+      before,
+      after,
+    })
+  } catch (error) {
+    warn("compaction hook failed", error)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Pruning helpers
+// ---------------------------------------------------------------------------
+
+function estimateTokens(value: unknown): number {
+  if (value === undefined || value === null) return 0
+  let text: string
+  try {
+    text = typeof value === "string" ? value : JSON.stringify(value)
+  } catch {
+    return 0
+  }
+  if (!text) return 0
+  let ascii = 0
+  let nonAscii = 0
+  for (let index = 0; index < text.length; index++) {
+    if (text.charCodeAt(index) < 128) ascii++
+    else nonAscii++
+  }
+  return Math.ceil(ascii / 3.6 + nonAscii)
+}
+
+function estimateToolTokens(tools: any): number {
+  if (!tools || typeof tools !== "object") return 0
+  let total = 0
+  for (const [name, tool] of Object.entries(tools)) {
+    total += estimateTokens(name)
+    total += estimateTokens((tool as any)?.description ?? "")
+    total += estimateTokens((tool as any)?.input ?? (tool as any)?.parameters ?? {})
+    total += estimateTokens((tool as any)?.output ?? {})
+  }
+  return total
+}
+
+function capString(value: string, max: number, placeholder: string): string {
+  if (value.length <= max) return value
+  return `${value.slice(0, max)}\n${placeholder} (${value.length} chars)`
+}
+
+function capPartStrings(part: any, max: number, placeholder: string, depth = 0) {
+  if (!part || typeof part !== "object" || depth > 4) return
+  for (const key of ["text", "value", "result"]) {
+    if (typeof part[key] === "string") part[key] = capString(part[key], max, placeholder)
+  }
+  if (part.output && typeof part.output === "object") {
+    for (const key of ["text", "value", "content"]) {
+      if (typeof part.output[key] === "string") {
+        part.output[key] = capString(part.output[key], max, placeholder)
+      }
+    }
+  }
+  if (Array.isArray(part.content)) {
+    for (const child of part.content) capPartStrings(child, max, placeholder, depth + 1)
+  }
+}
+
+function pruneMessage(message: any, options: any, isRecent: boolean) {
+  if (!message || typeof message !== "object") return
+  const role = String(message.role ?? "")
+
+  if (typeof message.content === "string") {
+    if (isRecent) return
+    if (role === "tool") {
+      message.content = capString(message.content, options.maxToolChars, options.placeholder)
+    } else if (options.maxTextChars > 0) {
+      message.content = capString(message.content, options.maxTextChars, "[text truncated]")
+    }
+    return
+  }
+
+  if (!Array.isArray(message.content)) return
+  const next: any[] = []
+  for (const part of message.content) {
+    if (!part || typeof part !== "object") {
+      next.push(part)
+      continue
+    }
+    const type = String(part.type ?? "")
+    if (options.dropReasoning && (type.includes("reasoning") || type.includes("thinking"))) continue
+    if (isRecent) {
+      next.push(part)
+      continue
+    }
+    if (role === "tool" || type === "tool-result" || type === "tool") {
+      capPartStrings(part, options.maxToolChars, options.placeholder)
+      next.push(part)
+      continue
+    }
+    if (type === "tool-call" && part.input && typeof part.input === "object") {
+      const serialized = JSON.stringify(part.input)
+      if (serialized.length > 4000) part.input = { _truncated: serialized.slice(0, 4000) }
+      next.push(part)
+      continue
+    }
+    if (options.maxTextChars > 0 && (type === "text" || type === "reasoning")) {
+      capPartStrings(part, options.maxTextChars, "[text truncated]")
+    }
+    next.push(part)
+  }
+  if (next.length === 0) next.push({ type: "text", text: "[content omitted to save context]" })
+  message.content = next
+}
+
+function pruneMessages(messages: any[], options: any) {
+  if (!Array.isArray(messages) || messages.length === 0) return
+  const keep = Math.max(0, Number(options.keepRecent) || 0)
+  const recentStart = Math.max(0, messages.length - keep)
+  for (let index = 0; index < messages.length; index++) {
+    pruneMessage(messages[index], options, index >= recentStart)
+  }
+}
+
+function shrinkToBudget(messages: any[], budget: number, options: any) {
+  if (!Array.isArray(messages) || estimateTokens(messages) <= budget) return
+
+  // Group by user turn so a tool-call/result pair is never split.
+  const groups: any[][] = []
+  let current: any[] = []
+  for (const message of messages) {
+    if (message?.role === "user" && current.length > 0) {
+      groups.push(current)
+      current = []
+    }
+    current.push(message)
+  }
+  if (current.length > 0) groups.push(current)
+
+  while (groups.length > 2 && estimateTokens(groups.flat()) > budget) groups.shift()
+  messages.splice(0, messages.length, ...groups.flat())
+
+  if (estimateTokens(messages) > budget) pruneMessages(messages, { ...options, keepRecent: 0 })
+}
+
+// ---------------------------------------------------------------------------
+// file_outline
+// ---------------------------------------------------------------------------
+
+async function outlineFile(filePath: string, maxItems: number, cwd?: string): Promise<string> {
+  if (!filePath) throw new Error("filePath is required")
+  const absolute = path.isAbsolute(filePath) ? filePath : path.resolve(cwd || process.cwd(), filePath)
+  const stat = await fs.stat(absolute)
+  if (!stat.isFile()) throw new Error(`Not a file: ${absolute}`)
+
+  let text = await fs.readFile(absolute, "utf8")
+  if (text.length > 2_000_000) text = text.slice(0, 2_000_000)
+  const lines = text.split(/\r?\n/)
+  const extension = path.extname(absolute).toLowerCase()
+
+  let hits: string[] = []
+  if (extension === ".json" || extension === ".jsonc") {
+    try {
+      const value = JSON.parse(text)
+      hits = jsonHits(value, lines, maxItems)
+    } catch {
+      // JSONC / malformed JSON: fall back to the generic scanner.
+    }
+  }
+
+  if (hits.length === 0) {
+    for (let index = 0; index < lines.length && hits.length < maxItems; index++) {
+      const line = lines[index]
+      if (isSymbolLine(line)) hits.push(`${index + 1}: ${line.trim().slice(0, 180)}`)
+    }
+  }
+
+  if (hits.length === 0) {
+    for (let index = 0; index < Math.min(lines.length, 80); index++) {
+      hits.push(`${index + 1}: ${lines[index].slice(0, 180)}`)
+    }
+  }
+
+  const ranges = suggestedRanges(lines.length, hits)
+  return [
+    `OUTLINE ${absolute}`,
+    `${lines.length} lines; ${stat.size} bytes; ${hits.length} structural hits (max ${maxItems}).`,
+    `Suggested reads: ${ranges.join(", ")}`,
+    "",
+    ...hits.slice(0, maxItems),
+  ]
+    .join("\n")
+    .slice(0, 12000)
+}
+
+function jsonHits(value: any, lines: string[], maxItems: number): string[] {
+  if (!value || typeof value !== "object") return []
+  const hits: string[] = []
+  const lineOf = (key: string): number => {
+    const needle = JSON.stringify(key)
+    for (let index = 0; index < lines.length; index++) {
+      if (lines[index].includes(needle)) return index + 1
+    }
+    return 1
+  }
+
+  for (const key of Object.keys(value)) {
+    const rendered = /^[A-Za-z_$][\w$]*$/.test(key) ? `.${key}` : `[${JSON.stringify(key)}]`
+    hits.push(`${lineOf(key)}: $${rendered}`)
+    if (hits.length >= maxItems) return hits
+  }
+
+  for (const container of ["$defs", "definitions"]) {
+    const defs = (value as any)[container]
+    if (!defs || typeof defs !== "object") continue
+    for (const key of Object.keys(defs)) {
+      hits.push(`${lineOf(key)}: ${container}.${key}`)
+      if (hits.length >= maxItems) return hits
+    }
+  }
+  return hits
+}
+
+function isSymbolLine(line: string): boolean {
+  const trimmed = line.trim()
+  if (!trimmed) return false
+  return (
+    /^#{1,6}\s+/.test(trimmed) ||
+    /^(export\s+)?(default\s+)?(async\s+)?(function|class|interface|type|enum|struct|trait|impl)\b/.test(trimmed) ||
+    /^(export\s+)?(const|let|var)\s+[A-Za-z_$][\w$]*\s*=/.test(trimmed) ||
+    /^(async\s+)?def\s+[A-Za-z_]/.test(trimmed) ||
+    /^(public|private|protected|static|async|final|abstract)\s+.*\([^)]*\)\s*\{?\s*$/.test(trimmed) ||
+    /^(func|type)\s+[A-Za-z_]/.test(trimmed) ||
+    /^[A-Za-z_$][\w$]*\s*\([^)]*\)\s*\{\s*$/.test(trimmed)
+  )
+}
+
+function suggestedRanges(lineCount: number, hits: string[]): string[] {
+  const ranges = new Set<string>()
+  ranges.add(`1-${Math.min(60, Math.max(1, lineCount))}`)
+  const numbers = hits
+    .map((hit) => Number.parseInt(hit, 10))
+    .filter((value) => Number.isFinite(value))
+  for (const number of numbers.slice(0, 3)) {
+    ranges.add(`${Math.max(1, number - 5)}-${Math.min(lineCount, number + 25)}`)
+  }
+  return [...ranges].slice(0, 5)
+}
+
+// ---------------------------------------------------------------------------
+// Misc
+// ---------------------------------------------------------------------------
+
+function safeParse(value: string): any {
+  if (!value || !value.startsWith("{")) return undefined
+  try {
+    return JSON.parse(value)
+  } catch {
+    return undefined
+  }
+}
