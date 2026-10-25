@@ -23,7 +23,15 @@ const MAX_READ_LINES = 300
 const MAX_TOOL_CHARS = 16000
 const GENERATE_BUDGET = 22000
 const COMPACTION_BUDGET = 10000
+const LARGE_FILE_BYTES = 50 * 1024
+const READ_PAGE_WARN_AT = 3
 const CACHE_DIR = path.join(os.homedir(), ".cache", "opencode", "context-guard")
+
+// Per-session, per-file read counters for automatic reminders.
+const readStats = new Map<
+  string,
+  { path: string; reads: number; sizeWarned: boolean; pagesWarned: boolean; updated: number }
+>()
 
 const BINARY_EXT =
   /\.(png|jpe?g|gif|webp|bmp|ico|pdf|zip|gz|tgz|7z|rar|exe|dll|so|dylib|mp4|mp3|wav|webm|woff2?|ttf|otf|bin|dat)$/i
@@ -44,16 +52,17 @@ Context window is 32K tokens. Never read a whole large file in one call.
 5) Summarize findings in your own words before moving on; do not keep raw file contents in context.
 6) For multi-file or multi-step work, delegate independent parts to the \`reader\`/\`general\` subagents and keep only their summaries here.
 7) If you must read many chunks yourself, maintain a notes file under .opencode/notes/ (gitignored) and rely on the notes instead of remembering raw chunks.
+8) If .opencode/notes/handoff.md exists, read it first. After major progress on a long task, update it with the write tool.
 Prefer tool calls over prose; keep explanations short unless asked.
 </context-discipline>`
 
 const COMPACTION_NOTE = `<handoff-rules>
-Local model context is ${CONTEXT_LIMIT} tokens. This request must leave ${OUTPUT_LIMIT} tokens for the reply.
-Write a concise handoff summary. Hard budget: about 1200 words / 1500 tokens.
-Do not call tools. Do not restate raw file contents, tool outputs, or AGENTS.md conventions; cite path:line instead.
-Include: (1) the user's goal, (2) decisions and what was done, (3) files changed with paths,
-(4) exact next steps, (5) blockers/open questions.
-Use terse bullets and the required summary template. Output only the summary. Do not mention compaction.
+Local model context is ${CONTEXT_LIMIT} tokens. This request must leave room for the reply.
+Write a very short handoff summary. Hard budget: at most 500 words / 700 tokens.
+Write at most 10 terse bullets. Do not think step by step. Do not call tools.
+Do not include code blocks, raw file contents, tool outputs, or AGENTS.md conventions; cite path:line instead.
+Include: (1) the user's goal, (2) what was done, (3) files changed, (4) exact next step, (5) blockers.
+Output only the bullets. Stop immediately when done. Do not mention compaction.
 </handoff-rules>`
 
 type ToolEditor = {
@@ -131,7 +140,7 @@ export default {
     try {
       if (ctx.tool?.hook) {
         await ctx.tool.hook("execute.before", onExecuteBefore)
-        await ctx.tool.hook("execute.after", onExecuteAfter)
+        await ctx.tool.hook("execute.after", async (result: any) => onExecuteAfter(ctx, result))
       }
     } catch (error) {
       warn("failed to register tool hooks", error)
@@ -149,6 +158,10 @@ export default {
     } catch (error) {
       warn("failed to register session hooks", error)
     }
+
+    // Note: aisdk language hooks do not fire for the built-in Ollama
+    // openai-compatible provider in 2.1.4, so compaction output is controlled
+    // by the #none model variant instead of an aisdk maxOutputTokens wrapper.
 
     let toolNames: string[] = []
     try {
@@ -243,13 +256,14 @@ async function onExecuteBefore(input: any) {
   input.input = args
 }
 
-async function onExecuteAfter(result: any) {
+async function onExecuteAfter(ctx: any, result: any) {
   try {
     if (!result || result.status !== "completed") return
     const tool = String(result.tool ?? "")
 
     if (tool === "read") {
       addReadPageHint(result)
+      await addReadReminder(ctx, result)
       return
     }
 
@@ -391,6 +405,111 @@ function addHintToContent(res: any, hint: string) {
 }
 
 // ---------------------------------------------------------------------------
+// Automatic large-file / repeated-read reminders (Phase 2)
+// ---------------------------------------------------------------------------
+
+async function addReadReminder(ctx: any, result: any) {
+  if (result?.agent === "reader") return
+
+  const filePath = result?.input?.filePath
+  if (typeof filePath !== "string" || filePath.length === 0) return
+  const sessionID = String(result?.sessionID ?? "unknown")
+
+  let directory: string | undefined
+  try {
+    const session = await ctx?.session?.get?.({ sessionID })
+    directory = typeof session?.directory === "string" ? session.directory : undefined
+  } catch {}
+
+  const absolute = path.isAbsolute(filePath)
+    ? filePath
+    : path.resolve(directory ?? process.cwd(), filePath)
+  const stat = await fs.stat(absolute).catch(() => undefined)
+  const size = stat?.size ?? 0
+
+  const key = `${sessionID}::${absolute}`
+  const entry = readStats.get(key) ?? {
+    path: absolute,
+    reads: 0,
+    sizeWarned: false,
+    pagesWarned: false,
+    updated: Date.now(),
+  }
+  entry.reads += 1
+  entry.updated = Date.now()
+  readStats.set(key, entry)
+  pruneReadStats()
+
+  const notes: string[] = []
+  if (size > LARGE_FILE_BYTES && !entry.sizeWarned) {
+    entry.sizeWarned = true
+    notes.push(
+      `This file is ${formatBytes(size)}. Do not read it page by page in the main context; use file_outline to target line ranges, or delegate to the reader subagent (subagent tool, agent=reader).`,
+    )
+  }
+  if (entry.reads >= READ_PAGE_WARN_AT && !entry.pagesWarned) {
+    entry.pagesWarned = true
+    notes.push(
+      `You have read ${entry.reads} pages of this file. Stop paging in the main context: use file_outline to target ranges, or delegate the rest to the reader subagent (subagent tool, agent=reader).`,
+    )
+  }
+  if (notes.length > 0) appendToolNote(result, notes.join(" "))
+}
+
+function appendToolNote(result: any, note: string) {
+  const res = result?.result
+  if (!res) return
+
+  const text = `[context-guard] ${note}`
+  const content = res.content
+
+  if (content === undefined || content === null) {
+    res.content = text
+    return
+  }
+
+  if (typeof content === "string") {
+    try {
+      const page = JSON.parse(content)
+      page.reminder = text
+      res.content = JSON.stringify(page)
+    } catch {
+      res.content = `${content}\n\n${text}`
+    }
+    return
+  }
+
+  if (Array.isArray(content)) {
+    for (const part of content) {
+      if (part?.type !== "text" || typeof part.text !== "string") continue
+      try {
+        const page = JSON.parse(part.text)
+        page.reminder = text
+        part.text = JSON.stringify(page)
+      } catch {
+        part.text += `\n\n${text}`
+      }
+      return
+    }
+    content.push({ type: "text", text })
+    return
+  }
+
+  if (res.output && typeof res.output === "object") res.output.reminder = text
+}
+
+function pruneReadStats() {
+  if (readStats.size <= 500) return
+  const entries = [...readStats.entries()].sort((a, b) => a[1].updated - b[1].updated)
+  for (let index = 0; index < entries.length - 400; index++) readStats.delete(entries[index][0])
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+  return `${Math.round(bytes / 1024)} KB`
+}
+
+// ---------------------------------------------------------------------------
 // Generic tool output cap
 // ---------------------------------------------------------------------------
 
@@ -511,12 +630,13 @@ async function onCompaction(ctx: any, draft: any) {
       shrinkToBudget(draft.messages, COMPACTION_BUDGET, options)
     }
 
-    if (Array.isArray(draft.system)) {
-      const already = draft.system.some(
-        (message: any) => typeof message?.text === "string" && message.text.includes("<handoff-rules>"),
-      )
-      if (!already) draft.system.push({ type: "text", text: COMPACTION_NOTE })
-    }
+    // Replace the whole system prompt. It can contain large repository
+    // instructions/AGENTS.md that the summary does not need and that the
+    // default compaction prompt explicitly says to omit. Keeping only the
+    // short handoff rules leaves much more room for the model to finish.
+    const systemNote = { type: "text", text: COMPACTION_NOTE }
+    if (Array.isArray(draft.system)) draft.system.splice(0, draft.system.length, systemNote)
+    else draft.system = [systemNote]
 
     const after = estimateTokens(draft.messages) + estimateTokens(draft.system)
     try {
