@@ -22,8 +22,12 @@ short context-discipline system prompt for the model.
 The plugin also tracks how much context it has used (an estimate based on message length) and prunes
 before each generate request against a **generation budget** (about 22K tokens) — keeping the recent
 conversation and dropping stale tool output as needed — and before each compaction request against a
-much tighter **compaction budget** (about 10K tokens) so the summary itself fits comfortably in a
-32K window. Tool schemas are stripped from the compaction input, and old reasoning fields are dropped.
+much tighter **compaction budget** (about 15K tokens) so the summary itself fits comfortably in a
+32K window. To get there it uses `pruneForCompaction`: it drops reasoning, keeps and caps the most
+recent tool results (4 kept, each capped at ~6K chars), caps assistant text and tool-call arguments
+(~4K), caps user text (~8K), drops the oldest user turns only if still over budget, and clears an
+oversized system prompt as a last resort (the default compaction template is appended as a user
+message, not system). Tool schemas are stripped from the compaction input.
 
 ## How much context is left?
 

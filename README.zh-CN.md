@@ -15,7 +15,7 @@
 3. 增加 `file_outline` 工具，让模型先看结构再读内容；
 4. 在生成和 compaction 前清理旧的工具输出，并注入简短的上下文纪律提示词。
 
-每次生成前会按 **生成预算**（约 22K tokens）清理；compaction 前会压缩到更紧的 **压缩预算**（约 10K tokens），并从 compaction 输入中移除工具 schema、丢弃过期的 reasoning 字段。
+每次生成前会按 **生成预算**（约 22K tokens）清理；compaction 前会把输入压缩到更紧的 **压缩预算**（约 15K tokens），通过 `pruneForCompaction` 处理：丢弃 reasoning、仅保留最近几个工具结果（每个最多约 6K chars）、限制 assistant 文本和 tool-call 参数（约 4K）、限制 user 文本（约 8K），只有仍超预算时才丢弃最旧的 user turns，最后才清理超长的 system prompt（默认 compaction 模板会以 user message 追加）。compaction 输入前会先移除工具 schema。
 
 插件同时记录每次 prune / compaction 前的 token 估算，方便实时观察上下文消耗。两个插件均内置 token 用量估算（按字符 ÷ 3.6）。
 

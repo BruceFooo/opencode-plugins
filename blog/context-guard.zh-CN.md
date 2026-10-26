@@ -16,7 +16,7 @@
 
 插件把 `read` 工具拆成 **300 行分页**（带 offset/limit 分页前进），增加 `file_outline` 工具让模型先看结构再读内容，并限制大工具输出——完整文本保存到本地缓存文件。
 
-在每次生成和 compaction 前，它都会 **清理** 旧的工具输出，并注入一段简短的上下文纪律提示词。它还会跟踪当前上下文消耗量（基于消息长度估算），并在每次生成前对照 **生成预算**（约 22K tokens）清理，compaction 前则压缩到 **压缩预算**（约 10K tokens），让摘要本身也能装进 32K 窗口。compaction 输入还会去掉工具 schema，并丢弃旧的 reasoning 字段。
+在每次生成和 compaction 前，它都会 **清理** 旧的工具输出，并注入一段简短的上下文纪律提示词。它还会跟踪当前上下文消耗量（基于消息长度估算），并在每次生成前对照 **生成预算**（约 22K tokens）清理，compaction 前则压缩到 **压缩预算**（约 15K tokens）——通过 `pruneForCompaction` 处理：丢弃 reasoning、仅保留最近几个工具结果（4 个，每个最多约 6K chars）、限制 assistant 文本和 tool-call 参数（约 4K）、限制 user 文本（约 8K），只有仍超预算时才丢弃最旧的 user turns，最后才清理超长的 system prompt（默认 compaction 模板会以 user message 追加）。compaction 输入前还会去掉工具 schema。
 
 ## 上下文还能撑多久？
 

@@ -22,7 +22,10 @@ const OUTPUT_LIMIT = 16184
 const MAX_READ_LINES = 300
 const MAX_TOOL_CHARS = 16000
 const GENERATE_BUDGET = 22000
-const COMPACTION_BUDGET = 10000
+const COMPACTION_INPUT_BUDGET = 15000
+const COMPACTION_KEEP_TOOL_RESULTS = 4
+const COMPACTION_TOOL_RESULT_MAX = 6000
+const COMPACTION_ASSISTANT_TEXT_MAX = 4000
 const LARGE_FILE_BYTES = 50 * 1024
 const READ_PAGE_WARN_AT = 3
 const CACHE_DIR = path.join(os.homedir(), ".cache", "opencode", "context-guard")
@@ -55,15 +58,6 @@ Context window is 32K tokens. Never read a whole large file in one call.
 8) If .opencode/notes/handoff.md exists, read it first. After major progress on a long task, update it with the write tool.
 Prefer tool calls over prose; keep explanations short unless asked.
 </context-discipline>`
-
-const COMPACTION_NOTE = `<handoff-rules>
-Local model context is ${CONTEXT_LIMIT} tokens. This request must leave room for the reply.
-Write a very short handoff summary. Hard budget: at most 500 words / 700 tokens.
-Write at most 10 terse bullets. Do not think step by step. Do not call tools.
-Do not include code blocks, raw file contents, tool outputs, or AGENTS.md conventions; cite path:line instead.
-Include: (1) the user's goal, (2) what was done, (3) files changed, (4) exact next step, (5) blockers.
-Output only the bullets. Stop immediately when done. Do not mention compaction.
-</handoff-rules>`
 
 type ToolEditor = {
   get(name: string): any
@@ -195,7 +189,6 @@ export default {
       outputLimit: OUTPUT_LIMIT,
       maxReadLines: MAX_READ_LINES,
       generateBudget: GENERATE_BUDGET,
-      compactionBudget: COMPACTION_BUDGET,
     })
   },
 }
@@ -611,34 +604,23 @@ async function onCompaction(ctx: any, draft: any) {
   try {
     if (draft?.model?.providerID !== "ollama") return
 
-    const before = estimateTokens(draft.messages) + estimateTokens(draft.system) + estimateToolTokens(draft.tools)
-
     // The summary request must not carry tool schemas.
     if (draft.tools && typeof draft.tools === "object") {
       for (const name of Object.keys(draft.tools)) delete draft.tools[name]
     }
 
-    if (Array.isArray(draft.messages)) {
-      const options = {
-        keepRecent: 2,
-        maxToolChars: 400,
-        maxTextChars: 1200,
-        dropReasoning: true,
-        placeholder: "[tool output omitted during compaction]",
-      }
-      pruneMessages(draft.messages, options)
-      shrinkToBudget(draft.messages, COMPACTION_BUDGET, options)
-    }
+    // Bound the prompt to the model's real 32K window. The compaction service
+    // can hand us a 36K-48K prompt, which Ollama then truncates; the summary
+    // model loses the template and either fails validation or fills the
+    // remaining context with output. Keep the most useful parts:
+    //   - drop reasoning
+    //   - keep the last few tool results, replace older ones
+    //   - cap assistant text, keep user text
+    //   - drop oldest user turns only if still over budget
+    //   - clear an oversized system prompt as a last resort (the default
+    //     compaction template is appended as a user message, not system)
+    const result = pruneForCompaction(draft)
 
-    // Replace the whole system prompt. It can contain large repository
-    // instructions/AGENTS.md that the summary does not need and that the
-    // default compaction prompt explicitly says to omit. Keeping only the
-    // short handoff rules leaves much more room for the model to finish.
-    const systemNote = { type: "text", text: COMPACTION_NOTE }
-    if (Array.isArray(draft.system)) draft.system.splice(0, draft.system.length, systemNote)
-    else draft.system = [systemNote]
-
-    const after = estimateTokens(draft.messages) + estimateTokens(draft.system)
     try {
       await fs.mkdir(CACHE_DIR, { recursive: true })
       await fs.writeFile(
@@ -649,8 +631,11 @@ async function onCompaction(ctx: any, draft: any) {
             sessionID: draft.sessionID,
             messages: Array.isArray(draft.messages) ? draft.messages.length : -1,
             tools: Object.keys(draft.tools ?? {}).length,
-            before,
-            after,
+            before: result.before,
+            after: result.after,
+            systemTokens: result.systemTokens,
+            messageTokens: result.messageTokens,
+            actions: result.actions,
             roles: Array.isArray(draft.messages) ? draft.messages.map((m: any) => m?.role) : [],
           },
           null,
@@ -660,15 +645,245 @@ async function onCompaction(ctx: any, draft: any) {
       )
     } catch {}
 
-    log(ctx, "info", "compaction input pruned", {
+    log(ctx, "info", "compaction input bounded", {
       sessionID: draft.sessionID,
       messages: draft.messages?.length,
-      before,
-      after,
+      before: result.before,
+      after: result.after,
+      actions: result.actions,
     })
   } catch (error) {
     warn("compaction hook failed", error)
   }
+}
+
+// ---------------------------------------------------------------------------
+// Compaction input budget
+// ---------------------------------------------------------------------------
+
+function pruneForCompaction(draft: any): {
+  before: number
+  after: number
+  systemTokens: number
+  messageTokens: number
+  actions: string[]
+} {
+  const actions: string[] = []
+  const messages = Array.isArray(draft?.messages) ? draft.messages : []
+  const beforeSystem = estimateTokens(draft?.system)
+  const beforeMessages = estimateTokens(messages)
+  const before = beforeSystem + beforeMessages
+
+  if (!Array.isArray(draft?.messages)) {
+    return { before, after: before, systemTokens: beforeSystem, messageTokens: beforeMessages, actions }
+  }
+
+  const reasoning = dropReasoningParts(messages)
+  if (reasoning > 0) actions.push(`dropped reasoning in ${reasoning} parts`)
+
+  const tool = capToolResults(messages, COMPACTION_KEEP_TOOL_RESULTS, COMPACTION_TOOL_RESULT_MAX)
+  if (tool.capped > 0) actions.push(`kept/capped ${tool.capped} recent tool results`)
+  if (tool.omitted > 0) actions.push(`omitted ${tool.omitted} old tool results`)
+
+  const assistantText = capAssistantText(messages, COMPACTION_ASSISTANT_TEXT_MAX)
+  if (assistantText > 0) actions.push(`capped ${assistantText} assistant text/tool-call parts`)
+
+  let systemTokens = estimateTokens(draft.system)
+  let messageTokens = estimateTokens(messages)
+
+  if (systemTokens + messageTokens > COMPACTION_INPUT_BUDGET) {
+    const userText = capUserText(messages, 8000)
+    if (userText > 0) actions.push(`capped ${userText} user texts`)
+    messageTokens = estimateTokens(messages)
+  }
+
+  if (systemTokens + messageTokens > COMPACTION_INPUT_BUDGET) {
+    const dropped = dropOldestUserTurns(messages, Math.max(0, COMPACTION_INPUT_BUDGET - systemTokens), 2)
+    if (dropped > 0) actions.push(`dropped ${dropped} old user turns`)
+    messageTokens = estimateTokens(messages)
+  }
+
+  systemTokens = estimateTokens(draft.system)
+  if (systemTokens + messageTokens > COMPACTION_INPUT_BUDGET && Array.isArray(draft.system) && draft.system.length > 0) {
+    // The default compaction template is appended as a user message, so
+    // clearing the system prompt does not remove the template. We add no
+    // custom text here: instructions in the system prompt can be copied into
+    // the summary and then obeyed by the next agent.
+    draft.system.splice(0, draft.system.length)
+    actions.push("cleared oversized system prompt")
+    systemTokens = 0
+  }
+
+  messageTokens = estimateTokens(messages)
+  return { before, after: systemTokens + messageTokens, systemTokens, messageTokens, actions }
+}
+
+function dropReasoningParts(messages: any[]): number {
+  let count = 0
+  for (const message of messages) {
+    if (!message || !Array.isArray(message.content)) continue
+    const next: any[] = []
+    for (const part of message.content) {
+      const type = String(part?.type ?? "")
+      if (type.includes("reasoning") || type.includes("thinking")) {
+        count++
+        continue
+      }
+      next.push(part)
+    }
+    if (next.length === 0 && message.content.length > 0) next.push({ type: "text", text: "[reasoning omitted]" })
+    message.content = next
+  }
+  return count
+}
+
+function capToolResults(messages: any[], keep: number, maxChars: number): { capped: number; omitted: number } {
+  let seen = 0
+  let capped = 0
+  let omitted = 0
+  const placeholder = "[old tool output omitted during compaction]"
+
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const message = messages[index]
+    if (!message || typeof message !== "object") continue
+    const role = String(message.role ?? "")
+    const content = message.content
+
+    if (role === "tool") {
+      if (typeof content === "string") {
+        seen++
+        if (seen > keep) {
+          message.content = placeholder
+          omitted++
+        } else {
+          if (content.length > maxChars) message.content = capString(content, maxChars, "[tool output truncated]")
+          capped++
+        }
+        continue
+      }
+      if (Array.isArray(content)) {
+        for (let partIndex = content.length - 1; partIndex >= 0; partIndex--) {
+          const part = content[partIndex]
+          if (!part || typeof part !== "object") continue
+          seen++
+          if (seen > keep) {
+            replacePartText(part, placeholder)
+            omitted++
+          } else {
+            capPartStrings(part, maxChars, "[tool output truncated]")
+            capped++
+          }
+        }
+        continue
+      }
+    }
+
+    if (Array.isArray(content)) {
+      for (let partIndex = content.length - 1; partIndex >= 0; partIndex--) {
+        const part = content[partIndex]
+        if (!part || typeof part !== "object") continue
+        const type = String(part.type ?? "")
+        if (type !== "tool-result" && type !== "tool") continue
+        seen++
+        if (seen > keep) {
+          replacePartText(part, placeholder)
+          omitted++
+        } else {
+          capPartStrings(part, maxChars, "[tool output truncated]")
+          capped++
+        }
+      }
+    }
+  }
+
+  return { capped, omitted }
+}
+
+function capAssistantText(messages: any[], maxChars: number): number {
+  let count = 0
+  for (const message of messages) {
+    if (!message || String(message.role ?? "") !== "assistant" || !Array.isArray(message.content)) continue
+    for (const part of message.content) {
+      if (!part || typeof part !== "object") continue
+      const type = String(part.type ?? "")
+      if (type === "text") {
+        if (typeof part.text === "string" && part.text.length > maxChars) {
+          part.text = capString(part.text, maxChars, "[assistant text truncated]")
+          count++
+        }
+        continue
+      }
+      if (type === "tool-call" && part.input && typeof part.input === "object") {
+        const serialized = JSON.stringify(part.input)
+        if (serialized.length > maxChars) {
+          part.input = { _truncated: serialized.slice(0, maxChars) }
+          count++
+        }
+      }
+    }
+  }
+  return count
+}
+
+function capUserText(messages: any[], maxChars: number): number {
+  let count = 0
+  for (const message of messages) {
+    if (!message || String(message.role ?? "") !== "user") continue
+    const content = message.content
+    if (typeof content === "string") {
+      if (content.length > maxChars) {
+        message.content = capString(content, maxChars, "[user text truncated]")
+        count++
+      }
+      continue
+    }
+    if (!Array.isArray(content)) continue
+    for (const part of content) {
+      if (part?.type === "text" && typeof part.text === "string" && part.text.length > maxChars) {
+        part.text = capString(part.text, maxChars, "[user text truncated]")
+        count++
+      }
+    }
+  }
+  return count
+}
+
+function replacePartText(part: any, text: string, depth = 0) {
+  if (!part || typeof part !== "object" || depth > 4) return
+  for (const key of ["text", "value", "result"]) {
+    if (typeof part[key] === "string") part[key] = text
+  }
+  if (part.output && typeof part.output === "object") {
+    for (const key of ["text", "value", "content"]) {
+      if (typeof part.output[key] === "string") part.output[key] = text
+    }
+  }
+  if (Array.isArray(part.content)) {
+    for (const child of part.content) replacePartText(child, text, depth + 1)
+  }
+}
+
+function dropOldestUserTurns(messages: any[], messageBudget: number, keepTurns: number): number {
+  if (!Array.isArray(messages) || messages.length === 0) return 0
+
+  const groups: any[][] = []
+  let current: any[] = []
+  for (const message of messages) {
+    if (message?.role === "user" && current.length > 0) {
+      groups.push(current)
+      current = []
+    }
+    current.push(message)
+  }
+  if (current.length > 0) groups.push(current)
+
+  let dropped = 0
+  while (groups.length > keepTurns && estimateTokens(groups.flat()) > messageBudget) {
+    groups.shift()
+    dropped++
+  }
+  if (dropped > 0) messages.splice(0, messages.length, ...groups.flat())
+  return dropped
 }
 
 // ---------------------------------------------------------------------------
@@ -781,27 +996,6 @@ function pruneMessages(messages: any[], options: any) {
   for (let index = 0; index < messages.length; index++) {
     pruneMessage(messages[index], options, index >= recentStart)
   }
-}
-
-function shrinkToBudget(messages: any[], budget: number, options: any) {
-  if (!Array.isArray(messages) || estimateTokens(messages) <= budget) return
-
-  // Group by user turn so a tool-call/result pair is never split.
-  const groups: any[][] = []
-  let current: any[] = []
-  for (const message of messages) {
-    if (message?.role === "user" && current.length > 0) {
-      groups.push(current)
-      current = []
-    }
-    current.push(message)
-  }
-  if (current.length > 0) groups.push(current)
-
-  while (groups.length > 2 && estimateTokens(groups.flat()) > budget) groups.shift()
-  messages.splice(0, messages.length, ...groups.flat())
-
-  if (estimateTokens(messages) > budget) pruneMessages(messages, { ...options, keepRecent: 0 })
 }
 
 // ---------------------------------------------------------------------------

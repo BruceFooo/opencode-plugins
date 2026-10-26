@@ -21,8 +21,12 @@ It works in four steps:
    context-discipline system prompt.
 
 Before every generate request it prunes against a **generation budget** (~22K tokens); before every
-compaction it shrinks the input to a tighter **compaction budget** (~10K tokens), strips tool schemas
-from the summary request, and drops stale reasoning fields.
+compaction it shrinks the input to a tighter **compaction budget** (~15K tokens) via `pruneForCompaction`.
+For the summary it drops reasoning, keeps and caps the most recent tool results (4 kept, each capped at
+~6K chars), caps assistant text and tool-call arguments (~4K), caps user text (~8K), drops the oldest user
+turns only if still over budget, and clears an oversized system prompt as a last resort (the default
+compaction template is appended as a user message, not system). Tool schemas are also stripped from the
+summary request.
 
 It also logs before/after token estimates on prune and compaction events so you can watch context usage
 in real time.
