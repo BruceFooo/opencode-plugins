@@ -6,7 +6,7 @@
 //   1. forces `read` into 300-line pages and repairs path -> filePath
 //   2. caps large tool outputs and saves the full text to a cache file
 //   3. adds file_outline so the model can inspect structure before reading
-//   4. prunes old tool output before generation and before compaction
+//   4. prunes old tool output before compaction
 //   5. injects a short context-discipline system prompt for Ollama models
 //
 // It intentionally does NOT change limit.output, limit.context, or the model
@@ -21,14 +21,31 @@ const CONTEXT_LIMIT = 32768
 const OUTPUT_LIMIT = 16184
 const MAX_READ_LINES = 300
 const MAX_TOOL_CHARS = 16000
-const GENERATE_BUDGET = 22000
 const COMPACTION_INPUT_BUDGET = 15000
 const COMPACTION_KEEP_TOOL_RESULTS = 4
-const COMPACTION_TOOL_RESULT_MAX = 6000
+const COMPACTION_TOOL_RESULT_MAX = 4000
 const COMPACTION_ASSISTANT_TEXT_MAX = 4000
 const LARGE_FILE_BYTES = 50 * 1024
 const READ_PAGE_WARN_AT = 3
 const CACHE_DIR = path.join(os.homedir(), ".cache", "opencode", "context-guard")
+const NEXT_MOVE_TTL_MS = 30 * 60 * 1000
+const NEXT_MOVE_MAX_INJECTIONS = 4
+const NEXT_MOVE_MARKER = "Execute the first incomplete item in the LAST Next Move section now"
+const NEXT_MOVE_NUDGE = `The compaction summary above is your task state. ${NEXT_MOVE_MARKER}. Do not commit until the preceding items are complete. Use only the line ranges named in the summary; if a range is missing, read only the smallest range you need, then make the edit.`
+const READ_BUDGET = 3
+const READ_GATE_MARKER = "Read budget exhausted since the last edit"
+const READ_GATE_NUDGE = `${READ_GATE_MARKER}. Do not call read again. Stop exploring and apply the first incomplete Next Move edit now. Use grep only for an exact missing symbol, or delegate to the reader subagent. Do not commit until the preceding items are complete.`
+
+type PendingNextMove = {
+  at: number
+  injected: number
+  lastInjectedAt: number
+  reads: number
+}
+
+// Sessions that just compacted, with injection state. The nudge is anchored to
+// the checkpoint and cancelled by a new user request or a successful edit.
+const pendingNextMove = new Map<string, PendingNextMove>()
 
 // Per-session, per-file read counters for automatic reminders.
 const readStats = new Map<
@@ -56,6 +73,7 @@ Context window is 32K tokens. Never read a whole large file in one call.
 6) For multi-file or multi-step work, delegate independent parts to the \`reader\`/\`general\` subagents and keep only their summaries here.
 7) If you must read many chunks yourself, maintain a notes file under .opencode/notes/ (gitignored) and rely on the notes instead of remembering raw chunks.
 8) If .opencode/notes/handoff.md exists, read it first. After major progress on a long task, update it with the write tool.
+9) After a compaction summary, execute its first incomplete Next Move item immediately. Do not re-read entire files; read only the line ranges named in the summary. If a range is missing, read only the smallest range you need, then edit. Do not commit until the preceding Next Move items are complete.
 Prefer tool calls over prose; keep explanations short unless asked.
 </context-discipline>`
 
@@ -145,8 +163,8 @@ export default {
       if (ctx.session?.hook) {
         // "context" is where the tool list and system prompt are assembled;
         // "generate" is the final pre-call pass. Both need the same trimming.
-        await ctx.session.hook("context", async (draft: any) => onGenerate(ctx, draft))
-        await ctx.session.hook("generate", async (draft: any) => onGenerate(ctx, draft))
+        await ctx.session.hook("context", async (draft: any) => onGenerate(ctx, draft, "context"))
+        await ctx.session.hook("generate", async (draft: any) => onGenerate(ctx, draft, "generate"))
         await ctx.session.hook("compaction", async (draft: any) => onCompaction(ctx, draft))
       }
     } catch (error) {
@@ -188,7 +206,6 @@ export default {
       contextLimit: CONTEXT_LIMIT,
       outputLimit: OUTPUT_LIMIT,
       maxReadLines: MAX_READ_LINES,
-      generateBudget: GENERATE_BUDGET,
     })
   },
 }
@@ -254,7 +271,16 @@ async function onExecuteAfter(ctx: any, result: any) {
     if (!result || result.status !== "completed") return
     const tool = String(result.tool ?? "")
 
+    if (["edit", "write", "patch"].includes(tool)) {
+      const sessionID = String(result.sessionID ?? "")
+      if (sessionID && (await clearPendingNextMove(sessionID))) {
+        await writeNudgeStatus({ sessionID, event: "cleared", reason: `tool:${tool}` })
+      }
+      return
+    }
+
     if (tool === "read") {
+      if ((await applyReadGate(ctx, result)) === "blocked") return
       addReadPageHint(result)
       await addReadReminder(ctx, result)
       return
@@ -491,6 +517,80 @@ function appendToolNote(result: any, note: string) {
   if (res.output && typeof res.output === "object") res.output.reminder = text
 }
 
+async function applyReadGate(ctx: any, result: any): Promise<"allowed" | "blocked"> {
+  // The reader subagent is the isolated reading context; do not count its
+  // pages against the main agent's budget.
+  if (result?.agent === "reader") return "allowed"
+
+  const sessionID = String(result?.sessionID ?? "")
+  if (!sessionID) return "allowed"
+
+  return withReadGateLock(async () => {
+    const pending = await getPendingNextMove(sessionID)
+    if (!pending) return "allowed"
+
+    if (Date.now() - pending.at > NEXT_MOVE_TTL_MS) {
+      await clearPendingNextMove(sessionID)
+      return "allowed"
+    }
+
+    pending.reads += 1
+    if (pending.reads > READ_BUDGET) {
+      await setPendingNextMove(sessionID, pending)
+      const text = `${READ_GATE_MARKER} (${READ_BUDGET} pages already read since the last edit). This read was blocked. Do not call read again. Apply the first incomplete Next Move edit now using the code already in context and the summary's line ranges. Use grep only for an exact missing symbol, or delegate to the reader subagent.`
+      blockReadResult(result, text)
+      await writeNudgeStatus({ sessionID, event: "read-gate-blocked", reads: pending.reads })
+      log(ctx, "info", "read gate blocked", { sessionID, reads: pending.reads })
+      return "blocked"
+    }
+
+    await setPendingNextMove(sessionID, pending)
+    if (pending.reads === READ_BUDGET) {
+      appendToolNote(
+        result,
+        "This is the last read before the edit gate. The next read will be blocked; make the Next Move edit now.",
+      )
+    }
+    return "allowed"
+  })
+}
+
+// Multiple tool results from one assistant step can run concurrently. Serialize
+// the read count so three parallel reads count as three, not one.
+let readGateQueue: Promise<void> = Promise.resolve()
+
+async function withReadGateLock<T>(fn: () => Promise<T>): Promise<T> {
+  const previous = readGateQueue
+  let release!: () => void
+  readGateQueue = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  await previous
+  try {
+    return await fn()
+  } finally {
+    release()
+  }
+}
+
+function blockReadResult(result: any, text: string) {
+  const located = locatePage(result)
+  if (located) {
+    located.page.content = text
+    located.page.truncated = false
+    delete located.page.next
+    located.page.hint = text
+    located.write(located.page)
+    located.contentHint(text)
+    return
+  }
+
+  const res = result?.result
+  if (!res) return
+  res.content = [{ type: "text", text }]
+  res.output = { type: "text", content: text }
+}
+
 function pruneReadStats() {
   if (readStats.size <= 500) return
   const entries = [...readStats.entries()].sort((a, b) => a[1].updated - b[1].updated)
@@ -550,7 +650,110 @@ async function saveFullOutput(tool: string, id: string, text: string): Promise<s
 // Session hooks
 // ---------------------------------------------------------------------------
 
-async function onGenerate(ctx: any, draft: any) {
+async function writeNudgeStatus(data: Record<string, unknown>) {
+  try {
+    await fs.mkdir(CACHE_DIR, { recursive: true })
+    await fs.writeFile(
+      path.join(CACHE_DIR, "last-nudge.json"),
+      JSON.stringify({ at: new Date().toISOString(), ...data }, null, 2),
+      "utf8",
+    )
+  } catch {}
+}
+
+function pendingNextMoveFile(sessionID: string): string {
+  const safe = sessionID.replace(/[^A-Za-z0-9_-]/g, "_")
+  return path.join(CACHE_DIR, `pending-next-move-${safe}.json`)
+}
+
+// The compaction and generate hooks can run in different plugin instances.
+// Keep the pending state on disk so the nudge does not depend on a shared
+// in-memory Map.
+async function getPendingNextMove(sessionID: string): Promise<PendingNextMove | undefined> {
+  try {
+    const text = await fs.readFile(pendingNextMoveFile(sessionID), "utf8")
+    const value = JSON.parse(text)
+    if (!value || typeof value.at !== "number") return undefined
+    const state: PendingNextMove = {
+      at: value.at,
+      injected: Number(value.injected) || 0,
+      lastInjectedAt: Number(value.lastInjectedAt) || 0,
+      reads: Number(value.reads) || 0,
+    }
+    pendingNextMove.set(sessionID, state)
+    return state
+  } catch {
+    pendingNextMove.delete(sessionID)
+    return undefined
+  }
+}
+
+async function setPendingNextMove(sessionID: string, state: PendingNextMove): Promise<void> {
+  pendingNextMove.set(sessionID, state)
+  try {
+    await fs.mkdir(CACHE_DIR, { recursive: true })
+    await fs.writeFile(pendingNextMoveFile(sessionID), JSON.stringify(state), "utf8")
+  } catch {}
+}
+
+async function clearPendingNextMove(sessionID: string): Promise<boolean> {
+  const existed = pendingNextMove.delete(sessionID)
+  try {
+    await fs.unlink(pendingNextMoveFile(sessionID))
+    return true
+  } catch {
+    return existed
+  }
+}
+
+function messageText(message: any): string {
+  if (!message || typeof message !== "object") return ""
+  const content = message.content
+  if (typeof content === "string") return content
+  if (!Array.isArray(content)) return ""
+  return content
+    .map((part: any) => (part && typeof part.text === "string" ? part.text : ""))
+    .join("\n")
+}
+
+function isCheckpointText(text: string): boolean {
+  return (
+    text.includes("<conversation-checkpoint>") ||
+    (text.includes("## Objective") && text.includes("## Next Move"))
+  )
+}
+
+function isCheckpointMessage(message: any): boolean {
+  return isCheckpointText(messageText(message))
+}
+
+function lastCheckpointIndex(messages: any[]): number {
+  for (let index = messages.length - 1; index >= 0; index--) {
+    if (isCheckpointMessage(messages[index])) return index
+  }
+  return -1
+}
+
+function isNudgeMessage(message: any): boolean {
+  return message?.role === "user" && messageText(message).includes(NEXT_MOVE_MARKER)
+}
+
+function isReadGateMessage(message: any): boolean {
+  return message?.role === "user" && messageText(message).includes(READ_GATE_MARKER)
+}
+
+function isInjectedGuidanceMessage(message: any): boolean {
+  return isNudgeMessage(message) || isReadGateMessage(message)
+}
+
+function lastUserIndex(messages: any[]): number {
+  for (let index = messages.length - 1; index >= 0; index--) {
+    if (messages[index]?.role === "user" && !isInjectedGuidanceMessage(messages[index])) return index
+  }
+  return -1
+}
+
+async function onGenerate(ctx: any, draft: any, phase: "context" | "generate") {
   try {
     if (draft?.model?.providerID !== "ollama") return
     if (draft?.agent === "compaction" || draft?.agent === "title" || draft?.agent === "summary") return
@@ -577,24 +780,78 @@ async function onGenerate(ctx: any, draft: any) {
       }
     }
 
-    const used =
-      estimateTokens(draft.messages) + estimateTokens(draft.system) + estimateToolTokens(draft.tools)
-    if (used <= GENERATE_BUDGET) return
+    // Do not prune history before generation. The previous 22K safety net
+    // removed recently-read code from the request just before compaction,
+    // which made the agent re-read the same files again and again. The
+    // compaction trigger and the bounded compaction input are enough.
 
-    pruneMessages(draft.messages, {
-      keepRecent: 6,
-      maxToolChars: 800,
-      maxTextChars: 0,
-      dropReasoning: true,
-      placeholder: "[old tool output pruned to save context; re-run the tool if needed]",
-    })
+    // After compaction, push the agent to execute the summary's Next Move
+    // instead of re-reading the same files. Only inject while the checkpoint is
+    // still the latest user turn; a new user request cancels the nudge. The
+    // pending state is persisted because the context and generate hooks can run
+    // in different plugin instances; hasNudge prevents duplicates within a draft.
+    const sessionID = String(draft.sessionID ?? "")
+    const pending = sessionID ? await getPendingNextMove(sessionID) : undefined
+    if (pending) {
+      const expired = Date.now() - pending.at > NEXT_MOVE_TTL_MS
+      const checkpointIndex = lastCheckpointIndex(draft.messages)
+      const lastUser = lastUserIndex(draft.messages)
+      const anchored = checkpointIndex >= 0 && (lastUser < 0 || checkpointIndex >= lastUser)
+      if (expired || (phase === "generate" && !anchored)) {
+        await clearPendingNextMove(sessionID)
+        await writeNudgeStatus({
+          sessionID,
+          phase,
+          event: "cleared",
+          reason: expired ? "expired" : "new-user-or-no-checkpoint",
+        })
+        return
+      }
+      // The context pass can run before the checkpoint is in the final message
+      // list; leave the decision to the generate pass.
+      if (!anchored) return
 
-    log(ctx, "info", "pruned old tool output", {
-      sessionID: draft.sessionID,
-      agent: draft.agent,
-      beforeTokens: used,
-      afterTokens: estimateTokens(draft.messages) + estimateTokens(draft.system) + estimateToolTokens(draft.tools),
-    })
+      if (pending.reads >= READ_BUDGET) {
+        // Hard gate: the model has read enough pages since the last edit.
+        // Remove the read tool for this request and tell it to edit now.
+        if (draft.tools && typeof draft.tools === "object") delete draft.tools.read
+        const hasGate = draft.messages.some(isReadGateMessage)
+        if (!hasGate) {
+          draft.messages.push({
+            role: "user",
+            content: [{ type: "text", text: READ_GATE_NUDGE }],
+          })
+          await writeNudgeStatus({
+            sessionID,
+            phase,
+            event: "read-gate",
+            reads: pending.reads,
+          })
+        }
+      } else {
+        const exhausted = pending.injected >= NEXT_MOVE_MAX_INJECTIONS
+        if (!exhausted) {
+          const hasNudge = draft.messages.some(isNudgeMessage)
+          if (!hasNudge) {
+            draft.messages.push({
+              role: "user",
+              content: [{ type: "text", text: NEXT_MOVE_NUDGE }],
+            })
+            pending.injected += 1
+            pending.lastInjectedAt = Date.now()
+            await setPendingNextMove(sessionID, pending)
+            await writeNudgeStatus({
+              sessionID,
+              phase,
+              event: "injected",
+              injected: pending.injected,
+              checkpointIndex,
+              lastUserIndex: lastUser,
+            })
+          }
+        }
+      }
+    }
   } catch (error) {
     warn("generate hook failed", error)
   }
@@ -634,6 +891,7 @@ async function onCompaction(ctx: any, draft: any) {
             before: result.before,
             after: result.after,
             systemTokens: result.systemTokens,
+            systemTokensBefore: result.systemTokensBefore,
             messageTokens: result.messageTokens,
             actions: result.actions,
             roles: Array.isArray(draft.messages) ? draft.messages.map((m: any) => m?.role) : [],
@@ -652,6 +910,33 @@ async function onCompaction(ctx: any, draft: any) {
       after: result.after,
       actions: result.actions,
     })
+
+    if (draft?.sessionID) {
+      const sessionID = String(draft.sessionID)
+      const previous = await getPendingNextMove(sessionID)
+      const previousActive = Boolean(previous && Date.now() - previous.at <= NEXT_MOVE_TTL_MS)
+      const checkpointIndex = lastCheckpointIndex(draft.messages)
+      const lastUser = lastUserIndex(draft.messages)
+      const newUserRequest = checkpointIndex >= 0 && lastUser > checkpointIndex
+      // Carry the exploration budget across compactions. Reading until the
+      // context fills, compacting, and reading again is exactly the loop this
+      // gate exists to break; only an edit or a new user request resets it.
+      const carriedReads = previousActive && !newUserRequest ? previous.reads : 0
+      await setPendingNextMove(sessionID, {
+        at: Date.now(),
+        injected: 0,
+        lastInjectedAt: 0,
+        reads: carriedReads,
+      })
+      await writeNudgeStatus({
+        sessionID,
+        phase: "compaction",
+        event: "pending-reset",
+        reads: carriedReads,
+        previousReads: previous?.reads ?? 0,
+        newUserRequest,
+      })
+    }
   } catch (error) {
     warn("compaction hook failed", error)
   }
@@ -665,6 +950,7 @@ function pruneForCompaction(draft: any): {
   before: number
   after: number
   systemTokens: number
+  systemTokensBefore: number
   messageTokens: number
   actions: string[]
 } {
@@ -675,8 +961,18 @@ function pruneForCompaction(draft: any): {
   const before = beforeSystem + beforeMessages
 
   if (!Array.isArray(draft?.messages)) {
-    return { before, after: before, systemTokens: beforeSystem, messageTokens: beforeMessages, actions }
+    return {
+      before,
+      after: before,
+      systemTokens: beforeSystem,
+      systemTokensBefore: beforeSystem,
+      messageTokens: beforeMessages,
+      actions,
+    }
   }
+
+  const deduped = dedupeCheckpointMessages(messages)
+  if (deduped > 0) actions.push(`deduped ${deduped} checkpoint sections`)
 
   const reasoning = dropReasoningParts(messages)
   if (reasoning > 0) actions.push(`dropped reasoning in ${reasoning} parts`)
@@ -715,7 +1011,88 @@ function pruneForCompaction(draft: any): {
   }
 
   messageTokens = estimateTokens(messages)
-  return { before, after: systemTokens + messageTokens, systemTokens, messageTokens, actions }
+  return {
+    before,
+    after: systemTokens + messageTokens,
+    systemTokens,
+    systemTokensBefore: beforeSystem,
+    messageTokens,
+    actions,
+  }
+}
+
+/**
+ * The compaction service asks the model to update the previous checkpoint.
+ * Small local models often append a fresh set of `##` sections instead of
+ * replacing the old ones, so summaries accumulate duplicate Next Move /
+ * Relevant Files / Important Context blocks. Keeping the last occurrence of
+ * each heading gives the model one clean checkpoint without losing the newest
+ * content.
+ */
+function dedupeCheckpointMessages(messages: any[]): number {
+  let removed = 0
+  for (const message of messages) {
+    if (!message || typeof message !== "object") continue
+    if (typeof message.content === "string") {
+      const result = dedupeCheckpointText(message.content)
+      if (result.removed > 0) {
+        message.content = result.text
+        removed += result.removed
+      }
+      continue
+    }
+    if (!Array.isArray(message.content)) continue
+    for (const part of message.content) {
+      if (!part || part.type !== "text" || typeof part.text !== "string") continue
+      const result = dedupeCheckpointText(part.text)
+      if (result.removed > 0) {
+        part.text = result.text
+        removed += result.removed
+      }
+    }
+  }
+  return removed
+}
+
+function dedupeCheckpointText(text: string): { text: string; removed: number } {
+  if (!text.includes("## Objective") || !text.includes("## Next Move")) {
+    return { text, removed: 0 }
+  }
+
+  const lines = text.split("\n")
+  const preamble: string[] = []
+  const sections: { heading: string; lines: string[]; index: number }[] = []
+  let current: { heading: string; lines: string[]; index: number } | undefined
+  let inFence = false
+
+  for (const line of lines) {
+    const trimmed = line.trim()
+    if (trimmed.startsWith("```")) {
+      if (current) current.lines.push(line)
+      else preamble.push(line)
+      inFence = !inFence
+      continue
+    }
+    if (!inFence && /^##\s+/.test(trimmed)) {
+      if (current) sections.push(current)
+      current = { heading: trimmed, lines: [line], index: sections.length }
+      continue
+    }
+    if (current) current.lines.push(line)
+    else preamble.push(line)
+  }
+  if (current) sections.push(current)
+  if (sections.length === 0) return { text, removed: 0 }
+
+  const last = new Map<string, { heading: string; lines: string[]; index: number }>()
+  for (const section of sections) last.set(section.heading, section)
+  if (last.size === sections.length) return { text, removed: 0 }
+
+  const kept = [...last.values()].sort((a, b) => a.index - b.index)
+  return {
+    text: [...preamble, ...kept.flatMap((section) => section.lines)].join("\n"),
+    removed: sections.length - kept.length,
+  }
 }
 
 function dropReasoningParts(messages: any[]): number {
@@ -831,6 +1208,10 @@ function capUserText(messages: any[], maxChars: number): number {
     if (!message || String(message.role ?? "") !== "user") continue
     const content = message.content
     if (typeof content === "string") {
+      // The previous checkpoint is the source for the updated summary. Never
+      // truncate it as ordinary user text; the budget pass below may drop
+      // older user turns instead.
+      if (isCheckpointText(content)) continue
       if (content.length > maxChars) {
         message.content = capString(content, maxChars, "[user text truncated]")
         count++
@@ -839,7 +1220,9 @@ function capUserText(messages: any[], maxChars: number): number {
     }
     if (!Array.isArray(content)) continue
     for (const part of content) {
-      if (part?.type === "text" && typeof part.text === "string" && part.text.length > maxChars) {
+      if (part?.type !== "text" || typeof part.text !== "string") continue
+      if (isCheckpointText(part.text)) continue
+      if (part.text.length > maxChars) {
         part.text = capString(part.text, maxChars, "[user text truncated]")
         count++
       }
@@ -908,18 +1291,6 @@ function estimateTokens(value: unknown): number {
   return Math.ceil(ascii / 3.6 + nonAscii)
 }
 
-function estimateToolTokens(tools: any): number {
-  if (!tools || typeof tools !== "object") return 0
-  let total = 0
-  for (const [name, tool] of Object.entries(tools)) {
-    total += estimateTokens(name)
-    total += estimateTokens((tool as any)?.description ?? "")
-    total += estimateTokens((tool as any)?.input ?? (tool as any)?.parameters ?? {})
-    total += estimateTokens((tool as any)?.output ?? {})
-  }
-  return total
-}
-
 function capString(value: string, max: number, placeholder: string): string {
   if (value.length <= max) return value
   return `${value.slice(0, max)}\n${placeholder} (${value.length} chars)`
@@ -939,62 +1310,6 @@ function capPartStrings(part: any, max: number, placeholder: string, depth = 0) 
   }
   if (Array.isArray(part.content)) {
     for (const child of part.content) capPartStrings(child, max, placeholder, depth + 1)
-  }
-}
-
-function pruneMessage(message: any, options: any, isRecent: boolean) {
-  if (!message || typeof message !== "object") return
-  const role = String(message.role ?? "")
-
-  if (typeof message.content === "string") {
-    if (isRecent) return
-    if (role === "tool") {
-      message.content = capString(message.content, options.maxToolChars, options.placeholder)
-    } else if (options.maxTextChars > 0) {
-      message.content = capString(message.content, options.maxTextChars, "[text truncated]")
-    }
-    return
-  }
-
-  if (!Array.isArray(message.content)) return
-  const next: any[] = []
-  for (const part of message.content) {
-    if (!part || typeof part !== "object") {
-      next.push(part)
-      continue
-    }
-    const type = String(part.type ?? "")
-    if (options.dropReasoning && (type.includes("reasoning") || type.includes("thinking"))) continue
-    if (isRecent) {
-      next.push(part)
-      continue
-    }
-    if (role === "tool" || type === "tool-result" || type === "tool") {
-      capPartStrings(part, options.maxToolChars, options.placeholder)
-      next.push(part)
-      continue
-    }
-    if (type === "tool-call" && part.input && typeof part.input === "object") {
-      const serialized = JSON.stringify(part.input)
-      if (serialized.length > 4000) part.input = { _truncated: serialized.slice(0, 4000) }
-      next.push(part)
-      continue
-    }
-    if (options.maxTextChars > 0 && (type === "text" || type === "reasoning")) {
-      capPartStrings(part, options.maxTextChars, "[text truncated]")
-    }
-    next.push(part)
-  }
-  if (next.length === 0) next.push({ type: "text", text: "[content omitted to save context]" })
-  message.content = next
-}
-
-function pruneMessages(messages: any[], options: any) {
-  if (!Array.isArray(messages) || messages.length === 0) return
-  const keep = Math.max(0, Number(options.keepRecent) || 0)
-  const recentStart = Math.max(0, messages.length - keep)
-  for (let index = 0; index < messages.length; index++) {
-    pruneMessage(messages[index], options, index >= recentStart)
   }
 }
 
